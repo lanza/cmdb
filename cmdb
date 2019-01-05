@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import socket
+import time
+from enum import Enum
+
+HOST = "127.0.0.1"
+PORT = 9033
+
+
+class DapPacketHeader:
+    def __init__(self, packetType, size):
+        self.packetType = DapPacketType(packetType)
+        self.size = size
+
+
+class DapPacketType(Enum):
+    Invalid = 0
+    scError = 1
+    scHandshake = 2
+    csHandshake = 3
+    scTargetStopped = 4
+    scTargetRunning = 5
+    csContinue = 6
+    csStepIn = 7
+    csStepOut = 8
+    csStepOver = 9
+    csBreakIn = 10
+    csSetNextStatement = 11
+    csTerminate = 12
+    csDetach = 13
+    csCreateExpression = 14
+    scExpressionCreated = 15
+    csQueryExpressionChildren = 16
+    scExpressionChildrenQueried = 17
+    csSetExpressionValue = 18
+    scExpressionUpdated = 19
+    BeforeFirstBreakpointRelatedCommand = 20
+    csCreateBreakpoint = 21
+    csCreateFunctionBreakpoint = 22
+    csCreateDomainSpecificBreakpoint = 23
+    scBreakpointCreated = 24
+    csDeleteBreakpoint = 25
+    csUpdateBreakpoint = 26
+    csQueryBreakpoint = 27
+    scBreakpointQueried = 28
+    scBreakpointUpdated = 29
+    AfterLastBreakpointRelatedCommand = 30
+    scDebugMessage = 31
+    scTargetExited = 32
+
+
+class TargetStopReason(Enum):
+    InitialBreakIn = 0
+    Breakpoint = 1
+    BreakInRequested = 2
+    StepComplete = 3
+    UnspecifiedEvent = 4
+    Exception = 5
+    SetNextStatement = 6
+
+
+def encode_unsigned(i: int) -> bytes:
+    return i.to_bytes(4, byteorder="little")
+
+
+def uint32_from_bytes(data):
+    return int.from_bytes(data, byteorder="little")
+
+
+def string_from_bytes(data):
+    return str(bytes)
+
+
+def read_string_at(data):
+    length = uint32_from_bytes(data[0:3])
+    if length > 0:
+        string = data[4 : (4 + length)].decode("ascii")
+        return (string, data[(4 + length) :])
+    else:
+        return ("", data[4:])
+
+
+def read_uint32_at(data):
+    return (uint32_from_bytes(data[0:3]), data[4:])
+
+
+class Backtrace:
+    def __init__(self, index, idk, args, file, line):
+        self.index = index
+        self.idk = idk
+        self.args = args
+        self.file = file
+        self.line = line
+
+
+def handle_scExpressionCreated(data, s):
+    id, data = read_uint32_at(data)
+    name, data = read_string_at(data)
+    type, data = read_string_at(data)
+    value, data = read_string_at(data)
+    flags, data = read_uint32_at(data)
+    child_count, data = read_uint32_at(data)
+
+    print("name: ", name)
+    print("value: ", value)
+    print("type: ", type)
+    print("flags: ", flags)
+    print("child_count: ", child_count)
+
+
+def handle_scTargetStopped(data, s):
+    stop_reason_int, data = read_uint32_at(data)
+    stop_reason = TargetStopReason(stop_reason_int)
+
+    int_param, data = read_uint32_at(data)
+    string_param, data = read_string_at(data)
+    backtrace_entry_count, data = read_uint32_at(data)
+
+    backtraces = []
+    print("backtrace_entry_count: ", backtrace_entry_count)
+
+    for i in range(backtrace_entry_count, 0, -1):
+        index, data = read_uint32_at(data)
+        idk, data = read_string_at(data)
+        args, data = read_string_at(data)
+        file, data = read_string_at(data)
+        line, data = read_uint32_at(data)
+        backtraces.append(Backtrace(index, idk, args, file, line))
+
+    print("stop_reason: ", stop_reason)
+    # print("int_param: ", int_param)
+    # print("string_param: ", string_param)
+
+    for b in backtraces:
+        # print("index: ", b.index)
+        print("file: ", b.file)
+        if len(b.idk) > 0:
+            print("function: ", b.idk)
+            print("args: ", b.args)
+        print("line: ", b.line)
+        pass
+
+    command_loop(s)
+
+
+def command_loop(s):
+    while True:
+        i = input("(cmdb) ").split(" ")
+        if i[0] == "c":
+            s.send(encode_unsigned(DapPacketType.csContinue.value) + encode_unsigned(0))
+            return
+        elif i[0].startswith("b"):
+            function = i[1]
+            length = len(function)
+            s.send(
+                encode_unsigned(DapPacketType.csCreateFunctionBreakpoint.value)
+                + encode_unsigned(length + 4)
+            )
+            s.send(encode_unsigned(length) + function.encode("ascii"))
+        elif i[0].startswith("expr"):
+            expression = i[1]
+            length = len(expression)
+            s.send(
+                encode_unsigned(DapPacketType.csCreateExpression.value)
+                + encode_unsigned(length + 8)
+            )
+            s.send(
+                encode_unsigned(0)
+                + encode_unsigned(length)
+                + expression.encode("ascii")
+            )
+            return
+
+
+def communicate():
+    time.sleep(3)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+
+        while True:
+            try:
+                # print(HOST)
+                # print(PORT)
+                s.connect((HOST, PORT))
+                break
+            except:
+                # print("passed")
+                time.sleep(1)
+                pass
+
+        # banner
+        data = s.recv(1024)
+        # print("banner: ", list(data))
+
+        while True:
+            data = s.recv(8)
+            if len(data) == 0:
+                break
+            packet_int = int.from_bytes(data[0:3], byteorder="little")
+            packet = DapPacketType(packet_int)
+            size = int.from_bytes(data[4:7], byteorder="little")
+            # print("packet_int: ", packet_int)
+            # print("PacketType: ", packet)
+            # print("size: ", size)
+            if size == 0:
+                continue
+
+            data = s.recv(size)
+            # print(str(data))
+            if packet == DapPacketType.scTargetStopped:
+                handle_scTargetStopped(data, s)
+            elif packet == DapPacketType.scHandshake:
+                s.send(
+                    encode_unsigned(DapPacketType.csHandshake.value)
+                    + encode_unsigned(0)
+                )
+            elif packet == DapPacketType.scExpressionCreated:
+                handle_scExpressionCreated(data, s)
+                command_loop(s)
+            else:
+                # print("d: ", list(data))
+                # print("d: ", str(data))
+                pass
+
+
+CHILDPID = 0
+
+
+def spawn_cmake():
+    global CHILDPID
+    newpid = os.fork()
+    if newpid == 0:
+        file = "/Users/lanza/Projects/CMake/build/bin/cmake"
+        os.execvp(file, [file] + sys.argv[1:])
+        os.execvp("/bin/echo", [file] + sys.argv[1:] + ["MUFFIN"])
+    else:
+        CHILDPID = newpid
+        return
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        for arg in sys.argv[1:]:
+            if arg.startswith("--debug-server-port"):
+                PORT = int(arg[20:])
+
+        spawn_cmake()
+    communicate()
+    # os.waitpid(CHILDPID,0)
