@@ -7,11 +7,41 @@ import time
 from enum import Enum
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import Completer, Completion
+import prompt_toolkit.completion as complet
+from prompt_toolkit.document import Document
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.key_binding import KeyBindings
 import random
 import signal
 import sys
 
 SOCK = None
+
+
+class CmdbCompleter(Completer):
+    commands =  [
+        "continue",
+        "children",
+        "break",
+        "watch",
+        "in",
+        "out",
+        "next",
+        "list",
+        "delete",
+        "set",
+        "expression",
+    ]
+    def get_completions(self, document: Document, complete_event):
+        if len(document.current_line.split(" ")) == 1:
+            matches = filter(lambda x:
+                            x.startswith(document.get_word_under_cursor()),
+                            CmdbCompleter.commands)
+            for match in matches:
+                yield Completion(match.lstrip(document.get_word_under_cursor()), start_position=0, display=match)
 
 
 def signal_handler(sig, frame):
@@ -197,6 +227,15 @@ def handle_scTargetStopped(data, s):
         b.args = b.args.replace(",", "")
         print(f"{b.index} - {b.file}:{b.line} - {b.idk}({b.args})")
 
+    file_len = len(backtraces[0].file)
+    if CONN is not None:
+        CONN.sendall(encode_unsigned(4 + 4 + file_len))
+        CONN.sendall(
+            encode_unsigned(backtraces[0].line)
+            + encode_unsigned(file_len)
+            + backtraces[0].file.encode("ascii")
+        )
+
     # print("int_param: ", int_param)
     # print("string_param: ", string_param)
 
@@ -226,6 +265,18 @@ class Breakpoint:
         self.line = line
 
 
+# kb = KeyBindings()
+
+# @kb.add('c-space')
+# def _(event):
+#     " Initialize autocompletion, or select the next completion. "
+#     buff = event.app.current_buffer
+#     if buff.complete_state:
+#         buff.complete_next()
+#     else:
+#         buff.start_completion(select_first=False)
+
+
 def command_loop(s):
     target_state = DapPacketType.scTargetStopped
 
@@ -233,8 +284,13 @@ def command_loop(s):
 
     last_command = ""
     breakpoints = []
+    session = PromptSession(history=FileHistory(os.path.expanduser("~/.cmdb_history")))
     while True:
-        i = prompt("(cmdb) ", completer=command_completer).split(" ")
+        i = session.prompt(
+            "(cmdb) ",
+            completer=CmdbCompleter(),
+            auto_suggest=AutoSuggestFromHistory(),
+        ).split(" ")
         if len(i[0]) > 0:
             last_command = i
         else:
@@ -379,7 +435,13 @@ def command_loop(s):
                 s.send(encode_unsigned(length) + function.encode("ascii"))
                 result = function
             else:
-                handle_other_packets(packet, data, s)
+                print("""
+    ERROR - usage:
+    break <function>
+    break <function> <stack frame>
+    break <filename> <line number>
+    """)
+                continue
 
             result_packet, data = read_packet(s)
             if result_packet == DapPacketType.scBreakpointCreated:
@@ -396,6 +458,7 @@ def command_loop(s):
             s.send(encode_unsigned(DapPacketType.csStepOver.value) + encode_unsigned(0))
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
+                result_packet, data = read_packet(s)
                 print("Debug Message: ", data)
             if result_packet == DapPacketType.scTargetRunning:
                 target_state = DapPacketType.scTargetRunning
@@ -403,6 +466,7 @@ def command_loop(s):
                 print("ERROR, unknown packet: ", result_packet, data)
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
+                result_packet, data = read_packet(s)
                 print("Debug Message: ", data)
             if result_packet == DapPacketType.scTargetStopped:
                 target_state = DapPacketType.scTargetStopped
@@ -414,6 +478,7 @@ def command_loop(s):
             s.send(encode_unsigned(DapPacketType.csStepIn.value) + encode_unsigned(0))
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
+                result_packet, data = read_packet(s)
                 print("Debug Message: ", data)
             if result_packet == DapPacketType.scTargetRunning:
                 target_state = DapPacketType.scTargetRunning
@@ -421,6 +486,7 @@ def command_loop(s):
                 print("ERROR, unknown packet: ", result_packet, data)
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
+                result_packet, data = read_packet(s)
                 print("Debug Message: ", data)
             if result_packet == DapPacketType.scTargetStopped:
                 target_state = DapPacketType.scTargetStopped
@@ -431,6 +497,7 @@ def command_loop(s):
             s.send(encode_unsigned(DapPacketType.csStepOut.value) + encode_unsigned(0))
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
+                result_packet, data = read_packet(s)
                 print("Debug Message: ", data)
             if result_packet == DapPacketType.scTargetRunning:
                 target_state = DapPacketType.scTargetRunning
@@ -438,6 +505,7 @@ def command_loop(s):
                 print("ERROR, unknown packet: ", result_packet, data)
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
+                result_packet, data = read_packet(s)
                 print("Debug Message: ", data)
             if result_packet == DapPacketType.scTargetStopped:
                 target_state = DapPacketType.scTargetStopped
@@ -500,7 +568,18 @@ def read_packet(s):
     return packet, data
 
 
-def communicate(port):
+SERVER = None
+CONN = None
+
+
+def communicate(port, server_port):
+    global CONN
+    if server_port is not None:
+        SERVER = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        SERVER.bind((HOST, server_port))
+        SERVER.listen()
+        CONN, addr = SERVER.accept()
+
     global SOCK
     time.sleep(3)
 
@@ -535,7 +614,13 @@ def spawn_cmake(port):
     newpid = os.fork()
     if newpid == 0:
         file = "/Users/lanza/Projects/CMake/build/bin/cmake"
-        os.execvp(file, [file] + sys.argv[1:] + [f"--debug-server-port={port}"])
+        index_of_dashdash = sys.argv.index("--")
+        os.execvp(
+            file,
+            [file]
+            + sys.argv[index_of_dashdash + 1 :]
+            + [f"--debug-server-port={port}"],
+        )
     else:
         return newpid
 
@@ -551,15 +636,20 @@ def finish():
 
 if __name__ == "__main__":
     port = random.randint(9000, 9900)
-    if len(sys.argv) > 1:
-        if sys.argv[1] != "--":
-            try:
-                port = int(sys.argv[1])
-            except Exception as e:
-                print('Second argument must be either a port number or "--"')
-                sys.exit(99)
+    server_port = None
+    try:
+        index_of_dashp = sys.argv.index("-p")
+        port = int(sys.argv[index_of_dashp + 1])
+    except:
+        pass
 
     signal.signal(signal.SIGINT, signal_handler)
     if "--" in sys.argv:
         child_pid = spawn_cmake(port)
-    communicate(port)
+    try:
+        index_of_dashg = sys.argv.index("-g")
+        server_port = int(sys.argv[index_of_dashg + 1])
+    except:
+        pass
+
+    communicate(port, server_port)
