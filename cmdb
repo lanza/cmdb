@@ -5,15 +5,35 @@ import sys
 import socket
 import time
 from enum import Enum
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import WordCompleter
+import random
+import signal
+import sys
+
+SOCK = None
+
+
+def signal_handler(sig, frame):
+    global SOCK
+    print(f"Found {sig}, {frame}")
+    SOCK.send(encode_unsigned(DapPacketType.csBreakIn.value) + encode_unsigned(0))
+
 
 HOST = "127.0.0.1"
-PORT = 9033
 
 
 class DapPacketHeader:
     def __init__(self, packetType, size):
         self.packetType = DapPacketType(packetType)
         self.size = size
+
+
+class CMakeDomainSpecificBreakpointType(Enum):
+    VariableAccessed = 0
+    VariableUpdated = 1
+    MessageSent = 2
+    TargetCreated = 3
 
 
 class DapPacketType(Enum):
@@ -104,11 +124,50 @@ def handle_scExpressionCreated(data, s):
     flags, data = read_uint32_at(data)
     child_count, data = read_uint32_at(data)
 
-    print("name: ", name)
-    print("value: ", value)
-    print("type: ", type)
-    print("flags: ", flags)
-    print("child_count: ", child_count)
+    if type == "(CMake Expression)":
+        print(f"ID: {id} - {name} = {value}")
+    elif type == "(CMake target)":
+        print(f"ID: {id} - target: {name}")
+    else:
+        print("name: ", name)
+        print("value: ", value)
+        print("type: ", type)
+        print("flags: ", flags)
+        print("child_count: ", child_count)
+
+
+class Things:
+    def __init__(self, id, name, type, value, zero, children_count):
+        self.id = id
+        self.name = name
+        self.type = type
+        self.value = value
+        self.zero = zero
+        self.children_count = children_count
+
+
+def handle_scExpressionChildrenQueried(data, s):
+    count, data = read_uint32_at(data)
+
+    things = []
+
+    for i in range(0, count):
+        id, data = read_uint32_at(data)
+        name, data = read_string_at(data)
+        type, data = read_string_at(data)
+        value, data = read_string_at(data)
+        zero, data = read_string_at(data)
+        children_count, data = read_string_at(data)
+        t = Things(id, name, type, value, zero, children_count)
+        things.append(t)
+
+    for t in things:
+        if t.type == "(property entry)":
+            print(f"{t.name} = {t.value}")
+        else:
+            print(
+                f"{t.id} - {t.name} - {t.value} - {t.type} - {t.zero} - {t.children_count}"
+            )
 
 
 def handle_scTargetStopped(data, s):
@@ -120,7 +179,7 @@ def handle_scTargetStopped(data, s):
     backtrace_entry_count, data = read_uint32_at(data)
 
     backtraces = []
-    print("backtrace_entry_count: ", backtrace_entry_count)
+    # print("backtrace_entry_count: ", backtrace_entry_count)
 
     for i in range(backtrace_entry_count, 0, -1):
         index, data = read_uint32_at(data)
@@ -130,60 +189,329 @@ def handle_scTargetStopped(data, s):
         line, data = read_uint32_at(data)
         backtraces.append(Backtrace(index, idk, args, file, line))
 
-    print("stop_reason: ", stop_reason)
-    # print("int_param: ", int_param)
-    # print("string_param: ", string_param)
+    if stop_reason == TargetStopReason.Breakpoint:
+        print("Stopped at breakpoint: ")
 
     for b in backtraces:
         # print("index: ", b.index)
-        print("file: ", b.file)
-        if len(b.idk) > 0:
-            print("function: ", b.idk)
-            print("args: ", b.args)
-        print("line: ", b.line)
-        pass
+        b.args = b.args.replace(",", "")
+        print(f"{b.index} - {b.file}:{b.line} - {b.idk}({b.args})")
 
-    command_loop(s)
+    # print("int_param: ", int_param)
+    # print("string_param: ", string_param)
+
+
+def handle_other_packets(packet, data, s):
+    if packet is None:
+        return None
+
+    if packet == DapPacketType.scHandshake:
+        s.send(encode_unsigned(DapPacketType.csHandshake.value) + encode_unsigned(0))
+    elif packet == DapPacketType.scTargetStopped:
+        handle_scTargetStopped(data, s)
+    elif packet == DapPacketType.scTargetExited:
+        print("Target exited")
+        finish()
+    elif packet == DapPacketType.scError:
+        error, data = read_string_at(data)
+        print(f":ERROR: {error}")
+    else:
+        print(f"ERROR, unknown packet: {packet} - {data}")
+
+
+class Breakpoint:
+    def __init__(self, id, keyword, line=None):
+        self.id = id
+        self.keyword = keyword
+        self.line = line
 
 
 def command_loop(s):
+    target_state = DapPacketType.scTargetStopped
+
+    command_completer = WordCompleter(["continue", "breakpoint", "expression", "next"])
+
+    last_command = ""
+    breakpoints = []
     while True:
-        i = input("(cmdb) ").split(" ")
-        if i[0] == "c":
-            s.send(encode_unsigned(DapPacketType.csContinue.value) + encode_unsigned(0))
-            return
-        elif i[0].startswith("b"):
-            function = i[1]
-            length = len(function)
+        i = prompt("(cmdb) ", completer=command_completer).split(" ")
+        if len(i[0]) > 0:
+            last_command = i
+        else:
+            i = last_command
+            print(" ".join(i))
+        if i[0].startswith("chil"):
+            id = int(i[1])
             s.send(
-                encode_unsigned(DapPacketType.csCreateFunctionBreakpoint.value)
-                + encode_unsigned(length + 4)
+                encode_unsigned(DapPacketType.csQueryExpressionChildren.value)
+                + encode_unsigned(4)
             )
-            s.send(encode_unsigned(length) + function.encode("ascii"))
+            s.send(encode_unsigned(id))
+
+            result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scExpressionChildrenQueried:
+                handle_scExpressionChildrenQueried(data, s)
+            else:
+                handle_other_packets(result_packet, data, s)
+
+        elif i[0].startswith("c"):
+            s.send(encode_unsigned(DapPacketType.csContinue.value) + encode_unsigned(0))
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                stream, data = read_uint32_at(data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
+                result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scTargetRunning:
+                target_state = DapPacketType.scTargetRunning
+            else:
+                handle_other_packets(result_packet, data, s)
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                stream, data = read_uint32_at(data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
+                result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scTargetStopped:
+                target_state = DapPacketType.scTargetStopped
+                handle_scTargetStopped(data, s)
+            else:
+                handle_other_packets(result_packet, data, s)
+        elif i[0].startswith("l"):  # list
+            for bp in breakpoints:
+                if bp.line == None:
+                    print(f"{bp.id}: {bp.keyword}")
+                else:
+                    print(f"{bp.id}: {bp.keyword}:{bp.line}")
+        elif i[0].startswith("del"):  # delete
+            id = int(i[1])
+            s.send(
+                encode_unsigned(DapPacketType.csDeleteBreakpoint.value)
+                + encode_unsigned(4)
+            )
+            s.send(encode_unsigned(id))
+
+            result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scBreakpointUpdated:
+                for index, bp in enumerate(breakpoints):
+                    if bp.id == id:
+                        del breakpoints[index]
+                        continue
+            else:
+                handle_other_packets(result_packet, data, s)
+
+        elif i[0] == "set":  # set
+            err = """
+    ERROR - set usage:
+        set <expression id> <value>
+    where the <expression id> is the id shown when calling expr for that variable
+"""
+            if len(i) != 3:
+                print(err)
+                continue
+
+            id = int(i[1])
+            var = i[2]
+            var_length = len(var)
+            s.send(
+                encode_unsigned(DapPacketType.csSetExpressionValue.value)
+                + encode_unsigned(4 + 4 + var_length)
+            )
+            s.send(
+                encode_unsigned(id) + encode_unsigned(var_length) + var.encode("ascii")
+            )
+            result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scExpressionUpdated:
+                print(f"Expression updated")
+            else:
+                handle_other_packets(result_packet, data, s)
+        elif i[0].startswith("w"):
+            if i[1].startswith("t"):
+                type = CMakeDomainSpecificBreakpointType.TargetCreated
+            elif i[1].startswith("r"):
+                type = CMakeDomainSpecificBreakpointType.VariableAccessed
+            elif i[1].startswith("w"):
+                type = CMakeDomainSpecificBreakpointType.VariableUpdated
+
+            variable = i[2]
+            var_length = len(variable)
+            s.send(
+                encode_unsigned(DapPacketType.csCreateDomainSpecificBreakpoint.value)
+                + encode_unsigned(4 + 4 + var_length + 4)
+            )
+            s.send(
+                encode_unsigned(type.value)
+                + encode_unsigned(var_length)
+                + variable.encode("ascii")
+                + encode_unsigned(0)
+            )
+
+            result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scBreakpointCreated:
+                id, data = read_uint32_at(data)
+                breakpoints.append(Breakpoint(id, variable))
+
+                print(f"Watchpoint id: {id} - created: {variable}")
+            else:
+                handle_other_packets(result_packet, data, s)
+        elif i[0].startswith("b"):
+            if len(i) == 3:
+                filename = i[1]
+                filename_length = len(filename)
+                line = int(i[2])
+                s.send(
+                    encode_unsigned(DapPacketType.csCreateBreakpoint.value)
+                    + encode_unsigned(4 + filename_length + 4)
+                )
+                s.send(
+                    encode_unsigned(filename_length)
+                    + filename.encode("ascii")
+                    + encode_unsigned(line)
+                )
+                result = filename + ":" + str(line)
+            elif len(i) == 2:
+                function = i[1]
+                length = len(function)
+                s.send(
+                    encode_unsigned(DapPacketType.csCreateFunctionBreakpoint.value)
+                    + encode_unsigned(length + 4)
+                )
+                s.send(encode_unsigned(length) + function.encode("ascii"))
+                result = function
+            else:
+                handle_other_packets(packet, data, s)
+
+            result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scBreakpointCreated:
+                # TODO: Change this to actually read the data
+
+                id, data = read_uint32_at(data)
+                breakpoints.append(Breakpoint(id, result))
+
+                print(f"Breakpoint id: {id} - created: {result}")
+            else:
+                handle_other_packets(packet, data, s)
+
+        elif i[0].startswith("n"):
+            s.send(encode_unsigned(DapPacketType.csStepOver.value) + encode_unsigned(0))
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                print("Debug Message: ", data)
+            if result_packet == DapPacketType.scTargetRunning:
+                target_state = DapPacketType.scTargetRunning
+            else:
+                print("ERROR, unknown packet: ", result_packet, data)
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                print("Debug Message: ", data)
+            if result_packet == DapPacketType.scTargetStopped:
+                target_state = DapPacketType.scTargetStopped
+                handle_scTargetStopped(data, s)
+            else:
+                handle_other_packets(packet, data, s)
+
+        elif i[0].startswith("in"):
+            s.send(encode_unsigned(DapPacketType.csStepIn.value) + encode_unsigned(0))
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                print("Debug Message: ", data)
+            if result_packet == DapPacketType.scTargetRunning:
+                target_state = DapPacketType.scTargetRunning
+            else:
+                print("ERROR, unknown packet: ", result_packet, data)
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                print("Debug Message: ", data)
+            if result_packet == DapPacketType.scTargetStopped:
+                target_state = DapPacketType.scTargetStopped
+                handle_scTargetStopped(data, s)
+            else:
+                handle_other_packets(packet, data, s)
+        elif i[0].startswith("out"):
+            s.send(encode_unsigned(DapPacketType.csStepOut.value) + encode_unsigned(0))
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                print("Debug Message: ", data)
+            if result_packet == DapPacketType.scTargetRunning:
+                target_state = DapPacketType.scTargetRunning
+            else:
+                print("ERROR, unknown packet: ", result_packet, data)
+            result_packet, data = read_packet(s)
+            while result_packet == DapPacketType.scDebugMessage:
+                print("Debug Message: ", data)
+            if result_packet == DapPacketType.scTargetStopped:
+                target_state = DapPacketType.scTargetStopped
+                handle_scTargetStopped(data, s)
+            else:
+                handle_other_packets(result_packet, data, s)
         elif i[0].startswith("expr"):
-            expression = i[1]
+            err = """
+    ERROR, expr form
+        expr <variable or target> <FrameNumber>
+    or
+        expr <variable or target>
+    the second form assumes the frame of the intial cmakelists file
+            """
+            if len(i) == 3:
+                try:
+                    frame = int(i[2])
+                except:
+                    print(err)
+                    continue
+                expression = i[1]
+            elif len(i) == 2:
+                frame = 0
+                expression = i[1]
+            else:
+                print(err)
+                continue
             length = len(expression)
             s.send(
                 encode_unsigned(DapPacketType.csCreateExpression.value)
                 + encode_unsigned(length + 8)
             )
             s.send(
-                encode_unsigned(0)
+                encode_unsigned(frame)
                 + encode_unsigned(length)
                 + expression.encode("ascii")
             )
-            return
+            result_packet, data = read_packet(s)
+            if result_packet == DapPacketType.scExpressionCreated:
+                handle_scExpressionCreated(data, s)
+            else:
+                handle_other_packets(result_packet, data, s)
 
 
-def communicate():
+def read_packet(s):
+    data = s.recv(8)
+    if len(data) == 0:
+        return (None, None)
+    packet_int, data = read_uint32_at(data)
+    packet = DapPacketType(packet_int)
+    size, data = read_uint32_at(data)
+    # print("packet_int: ", packet_int)
+    # print("PacketType: ", packet)
+    # print("size: ", size)
+    if size == 0:
+        return (packet, None)
+
+    data = s.recv(size)
+    # print(str(data))
+    return packet, data
+
+
+def communicate(port):
+    global SOCK
     time.sleep(3)
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 
         while True:
             try:
                 # print(HOST)
                 # print(PORT)
-                s.connect((HOST, PORT))
+                s.connect((HOST, port))
+                SOCK = s
                 break
             except:
                 # print("passed")
@@ -194,58 +522,44 @@ def communicate():
         data = s.recv(1024)
         # print("banner: ", list(data))
 
-        while True:
-            data = s.recv(8)
-            if len(data) == 0:
-                break
-            packet_int = int.from_bytes(data[0:3], byteorder="little")
-            packet = DapPacketType(packet_int)
-            size = int.from_bytes(data[4:7], byteorder="little")
-            # print("packet_int: ", packet_int)
-            # print("PacketType: ", packet)
-            # print("size: ", size)
-            if size == 0:
-                continue
-
-            data = s.recv(size)
-            # print(str(data))
-            if packet == DapPacketType.scTargetStopped:
-                handle_scTargetStopped(data, s)
-            elif packet == DapPacketType.scHandshake:
-                s.send(
-                    encode_unsigned(DapPacketType.csHandshake.value)
-                    + encode_unsigned(0)
-                )
-            elif packet == DapPacketType.scExpressionCreated:
-                handle_scExpressionCreated(data, s)
-                command_loop(s)
-            else:
-                # print("d: ", list(data))
-                # print("d: ", str(data))
-                pass
+        # should be handshake
+        packet, data = read_packet(s)
+        handle_other_packets(packet, data, s)
+        # shoudl be stopped
+        packet, data = read_packet(s)
+        handle_other_packets(packet, data, s)
+        command_loop(s)
 
 
-CHILDPID = 0
-
-
-def spawn_cmake():
-    global CHILDPID
+def spawn_cmake(port):
     newpid = os.fork()
     if newpid == 0:
         file = "/Users/lanza/Projects/CMake/build/bin/cmake"
-        os.execvp(file, [file] + sys.argv[1:])
-        os.execvp("/bin/echo", [file] + sys.argv[1:] + ["MUFFIN"])
+        os.execvp(file, [file] + sys.argv[1:] + [f"--debug-server-port={port}"])
     else:
-        CHILDPID = newpid
-        return
+        return newpid
+
+
+child_pid = None
+
+
+def finish():
+    global child_pid
+    os.waitpid(child_pid, 0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
+    port = random.randint(9000, 9900)
     if len(sys.argv) > 1:
-        for arg in sys.argv[1:]:
-            if arg.startswith("--debug-server-port"):
-                PORT = int(arg[20:])
+        if sys.argv[1] != "--":
+            try:
+                port = int(sys.argv[1])
+            except Exception as e:
+                print('Second argument must be either a port number or "--"')
+                sys.exit(99)
 
-        spawn_cmake()
-    communicate()
-    # os.waitpid(CHILDPID,0)
+    signal.signal(signal.SIGINT, signal_handler)
+    if "--" in sys.argv:
+        child_pid = spawn_cmake(port)
+    communicate(port)
