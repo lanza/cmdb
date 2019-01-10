@@ -17,31 +17,90 @@ from prompt_toolkit.key_binding import KeyBindings
 import random
 import signal
 import sys
+import _thread
+
+
 
 SOCK = None
+
+def listener_thread(name, s):
+    global top_frame
+    while True:
+        data = CONN.recv(4)
+        size, data = read_uint32_at(data)
+        data = CONN.recv(size)
+        var, data = read_string_at(data)
+        length = len(var)
+        s.send(
+            encode_unsigned(DapPacketType.csCreateExpression.value)
+            + encode_unsigned(length + 8)
+        )
+        s.send(
+            encode_unsigned(top_frame)
+            + encode_string(var)
+        )
+        result_packet, data = read_packet(s)
+        if result_packet == DapPacketType.scExpressionCreated:
+            id, data = read_uint32_at(data)
+            name, data = read_string_at(data)
+            type, data = read_string_at(data)
+            value, data = read_string_at(data)
+            flags, data = read_uint32_at(data)
+            child_count, data = read_uint32_at(data)
+
+            if type == "(CMake Expression)":
+                CONN.send(encode_unsigned(IDEType.VariableEvaluation.value) +
+                          encode_unsigned(len(value) + 4))
+                CONN.send(encode_string(value))
+            elif type == "(CMake target)":
+                CONN.send(encode_unsigned(IDEType.VariableEvaluation.value) +
+                          encode_unsigned(len(value) + 4))
+                CONN.send(encode_string(value))
+            else:
+                print("IDK: listener_thread")
+                sys.exit(33)
+        else:
+            handle_other_packets(result_packet, data, s)
+
+
+            # s.send(
+            #     encode_unsigned(DapPacketType.csCreateExpression.value)
+            #     + encode_unsigned(length + 8)
+            # )
+            # s.send(
+            #     encode_unsigned(frame)
+            #     + encode_unsigned(length)
+            #     + expression.encode("ascii")
+            # )
+            # result_packet, data = read_packet(s)
+            # if result_packet == DapPacketType.scExpressionCreated:
+            #     handle_scExpressionCreated(data, s)
+            # else:
+            #     handle_other_packets(result_packet, data, s)
+
 
 
 class CmdbCompleter(Completer):
     commands =  [
-        "continue",
-        "children",
-        "break",
-        "watch",
-        "in",
-        "out",
-        "next",
-        "list",
-        "delete",
-        "set",
-        "expression",
+        ("continue","continue - continue execution of the cmake file"),
+        ("children","children <id> - get a child properties of a target"),
+        ("break", "break <function> <frame> - set a breakpoint"),
+        ("watch", "watch (r|w) variable - set a watchpoint for reading or writing for a variable"),
+        ("in", "in - step into a function"),
+        ("out", "out - step out of a function"),
+        ("next", "next - step over a line"),
+        ("list", "list - list all breakpoints and their id numbers"),
+        ("delete", "delete <id> - delete a breakpoint"),
+        ("set", "set <id> <value> - set a varaible with <id> to <value>"),
+        ("expression", "expression <variable> - get the value of a variable")
     ]
     def get_completions(self, document: Document, complete_event):
         if len(document.current_line.split(" ")) == 1:
             matches = filter(lambda x:
-                            x.startswith(document.get_word_under_cursor()),
+                            x[0].startswith(document.get_word_under_cursor()),
                             CmdbCompleter.commands)
             for match in matches:
-                yield Completion(match.lstrip(document.get_word_under_cursor()), start_position=0, display=match)
+                yield Completion(match[0].lstrip(document.get_word_under_cursor()), start_position=0, display=match[0], display_meta=match[1])
 
 
 def signal_handler(sig, frame):
@@ -112,9 +171,32 @@ class TargetStopReason(Enum):
     SetNextStatement = 6
 
 
+class IDEType(Enum):
+    Error = 0
+    FileAndLocation = 1
+    VariableEvaluation = 2
+
+
 def encode_unsigned(i: int) -> bytes:
     return i.to_bytes(4, byteorder="little")
 
+def encode_string(s: str) -> bytes:
+    length = len(s)
+    data = encode_unsigned(length) + s.encode('ascii')
+    return data
+
+def encode_info(*args):
+    data = data()
+    for arg in args:
+        t = type(arg)
+        if t is int:
+            data += encode_unsigned(t)
+        elif t is str:
+            data += encode_string(t)
+        else:
+            print(f"Bad encode_info: {t}")
+
+    return data
 
 def uint32_from_bytes(data):
     return int.from_bytes(data, byteorder="little")
@@ -229,7 +311,7 @@ def handle_scTargetStopped(data, s):
 
     file_len = len(backtraces[0].file)
     if CONN is not None:
-        CONN.sendall(encode_unsigned(4 + 4 + file_len))
+        CONN.sendall(encode_unsigned(IDEType.FileAndLocation.value) + encode_unsigned(4 + 4 + file_len))
         CONN.sendall(
             encode_unsigned(backtraces[0].line)
             + encode_unsigned(file_len)
@@ -238,6 +320,7 @@ def handle_scTargetStopped(data, s):
 
     # print("int_param: ", int_param)
     # print("string_param: ", string_param)
+    return backtrace_entry_count - 1
 
 
 def handle_other_packets(packet, data, s):
@@ -277,11 +360,13 @@ class Breakpoint:
 #         buff.start_completion(select_first=False)
 
 
+top_frame = 0
 def command_loop(s):
     target_state = DapPacketType.scTargetStopped
 
     command_completer = WordCompleter(["continue", "breakpoint", "expression", "next"])
 
+    global top_frame
     last_command = ""
     breakpoints = []
     session = PromptSession(history=FileHistory(os.path.expanduser("~/.cmdb_history")))
@@ -330,7 +415,7 @@ def command_loop(s):
                 result_packet, data = read_packet(s)
             if result_packet == DapPacketType.scTargetStopped:
                 target_state = DapPacketType.scTargetStopped
-                handle_scTargetStopped(data, s)
+                top_frame = handle_scTargetStopped(data, s)
             else:
                 handle_other_packets(result_packet, data, s)
         elif i[0].startswith("l"):  # list
@@ -459,7 +544,8 @@ def command_loop(s):
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
                 result_packet, data = read_packet(s)
-                print("Debug Message: ", data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
             if result_packet == DapPacketType.scTargetRunning:
                 target_state = DapPacketType.scTargetRunning
             else:
@@ -467,10 +553,11 @@ def command_loop(s):
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
                 result_packet, data = read_packet(s)
-                print("Debug Message: ", data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
             if result_packet == DapPacketType.scTargetStopped:
                 target_state = DapPacketType.scTargetStopped
-                handle_scTargetStopped(data, s)
+                top_frame = handle_scTargetStopped(data, s)
             else:
                 handle_other_packets(packet, data, s)
 
@@ -479,7 +566,8 @@ def command_loop(s):
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
                 result_packet, data = read_packet(s)
-                print("Debug Message: ", data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
             if result_packet == DapPacketType.scTargetRunning:
                 target_state = DapPacketType.scTargetRunning
             else:
@@ -487,10 +575,11 @@ def command_loop(s):
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
                 result_packet, data = read_packet(s)
-                print("Debug Message: ", data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
             if result_packet == DapPacketType.scTargetStopped:
                 target_state = DapPacketType.scTargetStopped
-                handle_scTargetStopped(data, s)
+                top_frame = handle_scTargetStopped(data, s)
             else:
                 handle_other_packets(packet, data, s)
         elif i[0].startswith("out"):
@@ -498,7 +587,8 @@ def command_loop(s):
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
                 result_packet, data = read_packet(s)
-                print("Debug Message: ", data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
             if result_packet == DapPacketType.scTargetRunning:
                 target_state = DapPacketType.scTargetRunning
             else:
@@ -506,10 +596,11 @@ def command_loop(s):
             result_packet, data = read_packet(s)
             while result_packet == DapPacketType.scDebugMessage:
                 result_packet, data = read_packet(s)
-                print("Debug Message: ", data)
+                # message, data = read_string_at(data)
+                # print("Debug Message: ", message)
             if result_packet == DapPacketType.scTargetStopped:
                 target_state = DapPacketType.scTargetStopped
-                handle_scTargetStopped(data, s)
+                top_frame = handle_scTargetStopped(data, s)
             else:
                 handle_other_packets(result_packet, data, s)
         elif i[0].startswith("expr"):
@@ -528,7 +619,7 @@ def command_loop(s):
                     continue
                 expression = i[1]
             elif len(i) == 2:
-                frame = 0
+                frame = top_frame
                 expression = i[1]
             else:
                 print(err)
@@ -607,6 +698,7 @@ def communicate(port, server_port):
         # shoudl be stopped
         packet, data = read_packet(s)
         handle_other_packets(packet, data, s)
+        _thread.start_new_thread(listener_thread, ("muffin", s))
         command_loop(s)
 
 
